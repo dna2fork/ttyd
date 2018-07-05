@@ -1,3 +1,4 @@
+#include <pty.h>
 #include "server.h"
 
 int
@@ -49,6 +50,7 @@ parse_window_size(const char *json, struct winsize *size) {
     size->ws_col = (unsigned short) columns;
     size->ws_row = (unsigned short) rows;
 
+//printf(".parse_window_size  -> %s\n", json);
     return true;
 }
 
@@ -125,14 +127,109 @@ cleanup:
     tty_client_remove(client);
 }
 
+int
+ttyd_openpty (int *amaster, int *aslave, char *name,
+	 const struct termios *termp, const struct winsize *winp)
+{
+  char _buf[512];
+  char *buf = _buf;
+  int master, slave;
+
+//printf(". getpt\n");
+  //master = open("/dev/ptmx", O_RDWR|O_NOCTTY);
+  master = getpt ();
+  if (master == -1)
+    return -1;
+
+//printf(". grantpt\n");
+//  if (grantpt (master))
+//    goto fail;
+
+//printf(". unlockpt\n");
+  if (unlockpt (master))
+    goto fail;
+
+//printf(". pts_name\n");
+  buf = ptsname(master);
+  //if (ptsname_r (master, &buf, sizeof (_buf)))
+  //  goto fail;
+
+//printf(". open %s %p\n", buf, _buf);
+  slave = open (buf, O_RDWR | O_NOCTTY);
+  if (slave == -1)
+    {
+      //if (buf != _buf)
+      //free (buf);
+
+      goto fail;
+    }
+
+  /* XXX Should we ignore errors here?  */
+  if(termp)
+    tcsetattr (slave, TCSAFLUSH, termp);
+  if (winp)
+    ioctl (slave, TIOCSWINSZ, winp);
+
+  *amaster = master;
+  *aslave = slave;
+  if (name != NULL)
+    strcpy (name, buf);
+
+//  if (buf != _buf)
+//    free (buf);
+  return 0;
+
+ fail:
+  close (master);
+  return -1;
+}
+
+int
+ttyd_forkpty (amaster, name, termp, winp)
+     int *amaster;
+     char *name;
+     const struct termios *termp;
+     const struct winsize *winp;
+{
+  int master, slave, pid;
+
+  if (ttyd_openpty (&master, &slave, name, termp, winp) == -1)
+    return -1;
+
+  switch (pid = fork ()) {
+  case -1:
+    close (master);
+    close (slave);
+    return -1;
+  case 0:
+    /* Child.  */
+    close (master);
+    if (login_tty (slave))
+      _exit (1);
+
+    return 0;
+  default:
+    /* Parent.  */
+    *amaster = master;
+    close (slave);
+
+    return pid;
+  }
+}
+
 void *
+//int
 thread_run_command(void *args) {
+//printf("hello!\n");
     struct tty_client *client;
     int pty;
     fd_set des_set;
 
+    if (!args) pthread_exit((void *) 0);
     client = (struct tty_client *) args;
-    pid_t pid = forkpty(&pty, NULL, NULL, NULL);
+//printf("client: %p\n", client);
+    pid_t pid = ttyd_forkpty(&pty, NULL, NULL, NULL);
+//printf("forkpty: %d\n", pty);
 
     switch (pid) {
         case -1: /* error */
@@ -183,6 +280,7 @@ thread_run_command(void *args) {
     }
 
     pthread_exit((void *) 0);
+    //return 0;
 }
 
 int
@@ -191,9 +289,11 @@ callback_tty(struct lws *wsi, enum lws_callback_reasons reason,
     struct tty_client *client = (struct tty_client *) user;
     char buf[256];
     size_t n = 0;
+//printf(".0 --> %d\n", reason);
 
     switch (reason) {
         case LWS_CALLBACK_FILTER_PROTOCOL_CONNECTION:
+//printf(".1 LWS_CALLBACK_FILTER_PROTOCOL_CONNECTION\n");
             if (server->once && server->client_count > 0) {
                 lwsl_warn("refuse to serve WS client due to the --once option.\n");
                 return 1;
@@ -214,6 +314,7 @@ callback_tty(struct lws *wsi, enum lws_callback_reasons reason,
             break;
 
         case LWS_CALLBACK_ESTABLISHED:
+//printf(".1 LWS_CALLBACK_ESTABLISHED\n");
             client->running = false;
             client->initialized = false;
             client->authenticated = false;
@@ -233,9 +334,11 @@ callback_tty(struct lws *wsi, enum lws_callback_reasons reason,
             lws_hdr_copy(wsi, buf, sizeof(buf), WSI_TOKEN_GET_URI);
 
             lwsl_notice("WS   %s - %s (%s), clients: %d\n", buf, client->address, client->hostname, server->client_count);
+//printf(".1\n");
             break;
 
         case LWS_CALLBACK_SERVER_WRITEABLE:
+//printf(".1 LWS_CALLBACK_SERVER_WRITEABLE\n");
             if (!client->initialized) {
                 if (send_initial_message(wsi) < 0) {
                     tty_client_remove(client);
@@ -267,6 +370,7 @@ callback_tty(struct lws *wsi, enum lws_callback_reasons reason,
             break;
 
         case LWS_CALLBACK_RECEIVE:
+//printf(".1 LWS_CALLBACK_RECEIVE\n");
             if (client->buffer == NULL) {
                 client->buffer = xmalloc(len);
                 client->len = len;
@@ -290,8 +394,10 @@ callback_tty(struct lws *wsi, enum lws_callback_reasons reason,
                 return 0;
             }
 
+//printf(".2 --> %d\n", command);
             switch (command) {
                 case INPUT:
+//printf(".2 INPUT\n");
                     if (client->pty == 0)
                         break;
                     if (server->readonly)
@@ -304,13 +410,16 @@ callback_tty(struct lws *wsi, enum lws_callback_reasons reason,
                     }
                     break;
                 case RESIZE_TERMINAL:
+//printf(".2 RESIZE_TERMINAL %d\n", client->pty);
                     if (parse_window_size(client->buffer + 1, &client->size) && client->pty > 0) {
+//printf(".2 ioctl %d %d %p\n", client->pty, TIOCSWINSZ, client->size);
                         if (ioctl(client->pty, TIOCSWINSZ, &client->size) == -1) {
                             lwsl_err("ioctl TIOCSWINSZ: %d (%s)\n", errno, strerror(errno));
                         }
                     }
                     break;
                 case JSON_DATA:
+//printf(".2 JSON_DATA\n");
                     if (client->pid > 0)
                         break;
                     if (server->credential != NULL) {
@@ -329,15 +438,22 @@ callback_tty(struct lws *wsi, enum lws_callback_reasons reason,
                             return -1;
                         }
                     }
+                    //int err = thread_run_command(client);
                     int err = pthread_create(&client->thread, NULL, thread_run_command, client);
+//printf(".p %p\n", client);
+                    while (client && client->pty <= 0) ; // wait for pty created
+//printf(".p %x\n", client->pty);
+//printf(".p %d %d\n", ((char*)client)[0], client->pty);
                     if (err != 0) {
                         lwsl_err("pthread_create return: %d\n", err);
                         return 1;
                     }
                     break;
                 default:
-                    lwsl_warn("ignored unknown message type: %c\n", command);
-                    break;
+//printf(".2 ...\n");
+                    lwsl_warn("ignore unknown message type: %c\n", command);
+                    lws_close_reason(wsi, LWS_CLOSE_STATUS_INVALID_PAYLOAD, NULL, 0);
+                    return -1;
             }
 
             if (client->buffer != NULL) {
@@ -347,6 +463,7 @@ callback_tty(struct lws *wsi, enum lws_callback_reasons reason,
             break;
 
         case LWS_CALLBACK_CLOSED:
+//printf(".1 LWS_CALLBACK_CLOSED\n");
             tty_client_destroy(client);
             lwsl_notice("WS closed from %s (%s), clients: %d\n", client->address, client->hostname, server->client_count);
             if (server->once && server->client_count == 0) {
